@@ -5,9 +5,9 @@ declare(strict_types=1);
 namespace Atom\Database;
 
 use Atom\Database\Orm\ColumnMetadata;
-use Atom\Database\Orm\DirectUpdateValueProviderInterface;
 use Atom\Database\Orm\EntityMetadata;
 use Atom\Database\Orm\EntityMetadataFactory;
+use Atom\Database\Orm\UpdateValueProviderInterface;
 use Atom\Database\Sql\Query;
 use Atom\Database\Sql\UpsertQuery;
 use DateTimeInterface;
@@ -17,6 +17,9 @@ use RuntimeException;
 abstract class Model
 {
     private const int ID_BATCH_SIZE = 500;
+
+    /** @var array<class-string<Model>, Db> */
+    private static array $connections = [];
 
     /** @var array<string, mixed>|null Writable column values observed during hydration or written by this model. */
     private ?array $originalColumnValues = null;
@@ -76,6 +79,17 @@ abstract class Model
     public static function useDb(Db $db): void
     {
         DefaultDatabase::set($db);
+    }
+
+    /** Assign a database to this model class and its descendants, or pass null to clear this class's assignment. */
+    public static function useConnection(?Db $db): void
+    {
+        if ($db === null) {
+            unset(self::$connections[static::class]);
+            return;
+        }
+
+        self::$connections[static::class] = $db;
     }
 
     /** @return DbSelect<static> */
@@ -191,9 +205,9 @@ abstract class Model
             if ($provider === null) {
                 continue;
             }
-            if (!is_subclass_of($provider, DirectUpdateValueProviderInterface::class)) {
+            if (!is_subclass_of($provider, UpdateValueProviderInterface::class)) {
                 throw new RuntimeException(
-                    "{$provider} must implement DirectUpdateValueProviderInterface to update {$column->columnName} by ID. "
+                    "{$provider} must implement UpdateValueProviderInterface to update {$column->columnName} by ID. "
                     . "Use save() on a loaded model."
                 );
             }
@@ -241,7 +255,19 @@ abstract class Model
 
     protected static function db(): Db
     {
-        return DefaultDatabase::get();
+        return self::configuredDatabase() ?? DefaultDatabase::get();
+    }
+
+    /** @internal */
+    final public static function configuredDatabase(): ?Db
+    {
+        for ($class = static::class; $class !== false; $class = get_parent_class($class)) {
+            if (isset(self::$connections[$class])) {
+                return self::$connections[$class];
+            }
+        }
+
+        return null;
     }
 
     private static function metadata(): EntityMetadata

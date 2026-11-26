@@ -29,8 +29,12 @@ use DateTimeImmutable;
 use PDO;
 use PHPUnit\Framework\TestCase;
 
+require_once __DIR__ . "/GeneratedKeyMappingAssertions.php";
+
 final class DbTest extends TestCase
 {
+    use GeneratedKeyMappingAssertions;
+
     public function testDatabaseConnectionDistinguishesUniqueViolationsFromOtherConstraints(): void
     {
         $connection = self::memory();
@@ -70,6 +74,19 @@ final class DbTest extends TestCase
         $this->assertSame(1, (int) $db->scalar(Query::select("users")->count()));
     }
 
+    public function testEmptyInListMatchesNoRowsAndPreservesOtherPredicates(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute("CREATE TABLE users (id INTEGER PRIMARY KEY)");
+        $db->execute("INSERT INTO users (id) VALUES (1), (2)");
+
+        self::assertSame([], $db->all(Query::select("users")->where("id", [])));
+        self::assertSame([["id" => 2]], $db->all(Query::select("users")->where("id", [])->orWhere("id", 2)));
+
+        $db->execute(Query::delete("users")->where("id", []));
+        self::assertSame(2, (int) $db->scalar(Query::select("users")->count()));
+    }
+
     public function testDbServiceExecutesRawSqlWithParameters(): void
     {
         $db = new Db(self::memory());
@@ -86,6 +103,24 @@ final class DbTest extends TestCase
         ));
     }
 
+    public function testExecutionParametersOverrideQueryAndCommandBindings(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, team INTEGER)");
+        $db->execute("INSERT INTO users (id, team) VALUES (1, 7), (2, 7), (3, 8)");
+
+        $query = Query::select("users")->columns("id")
+            ->whereExp("id = :id", ["id" => 1])->where("team", 7);
+
+        foreach ([$query, $db->compile($query)] as $input) {
+            self::assertSame(2, $db->scalar($input, [":id" => 2]));
+            self::assertSame(2, $db->scalar($input, ["id" => 2]));
+            self::assertNull($db->first($input, ["id" => 3]));
+            self::assertNull($db->first($input, ["id" => null]));
+            self::assertSame(1, $db->scalar($input));
+        }
+    }
+
     public function testNestedQueriesPreserveCallerAndGeneratedBindingsAcrossScopes(): void
     {
         $db = new Db(self::memory());
@@ -99,6 +134,11 @@ final class DbTest extends TestCase
         $query->getWhere()->whereInSubquery("id", $members);
 
         $this->assertSame([["id" => 1, "other_member" => 3]], $db->all($query));
+
+        $membersWithReusedName = Query::select("users")->columns("id")->whereExp("id <= :p1", ["p1" => 2]);
+        $queryWithReusedName = Query::select("users")->columns("id")->whereExp("id = :p1", ["p1" => 1]);
+        $queryWithReusedName->getWhere()->whereInSubquery("id", $membersWithReusedName);
+        $this->assertSame([["id" => 1]], $db->all($queryWithReusedName));
     }
 
     public function testUpdatePreservesGeneratedAssignmentAndCallerFilter(): void
@@ -470,6 +510,67 @@ final class DbTest extends TestCase
         $this->assertNull($db->select(DbHydratedUser::class)->where("id", 1)->first());
     }
 
+    public function testGeneratedKeysRespectMappedColumnAndPropertyTypes(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute('CREATE TABLE key_mapping_fixture ("GeneratedKey" INTEGER PRIMARY KEY, label VARCHAR(20))');
+
+        $this->assertGeneratedKeysMatchMappedProperties($db);
+    }
+
+    public function testFailedInsertLeavesGeneratedKeyUnsetAndCanBeRetried(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)");
+        $db->execute(Query::insert("users")->values(["name" => "Taken"]));
+
+        $user = new DbModelUser();
+        $user->name = "Taken";
+        try {
+            $db->save($user);
+            self::fail("Expected the duplicate name to fail.");
+        } catch (UniqueViolationException) {
+            self::assertFalse(isset($user->id));
+        }
+
+        $user->name = "Corrected";
+        self::assertSame(1, $db->save($user));
+        self::assertSame("Corrected", $db->scalar(Query::select("users")->columns("name")->where("id", $user->id)));
+        self::assertSame(2, (int) $db->scalar(Query::select("users")->count()));
+    }
+
+    public function testSaveInsertsAModelWithOnlyAGeneratedPrimaryKey(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute("CREATE TABLE default_only_fixture (id INTEGER PRIMARY KEY)");
+
+        $model = new DbDefaultOnlyModel();
+        self::assertSame(1, $db->save($model));
+        self::assertSame(1, $model->id);
+        self::assertSame([["id" => 1]], $db->all("SELECT id FROM default_only_fixture"));
+    }
+
+    public function testSaveUpdatesExistingRowsWithZeroPrimaryKeys(): void
+    {
+        $db = new Db(self::memory());
+        $db->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+        $db->execute("INSERT INTO users VALUES (0, 'Before')");
+        $user = $db->select(DbModelUser::class)->find(0);
+        self::assertInstanceOf(DbModelUser::class, $user);
+        $user->name = "After";
+
+        $db->execute("CREATE TABLE articles (article_key TEXT PRIMARY KEY, category_id INTEGER, fallback_id INTEGER)");
+        $db->execute("INSERT INTO articles VALUES ('0', 1, 2)");
+        $article = $db->select(DbCategorizedArticle::class)->find("0");
+        self::assertInstanceOf(DbCategorizedArticle::class, $article);
+        $article->categoryId = 3;
+
+        self::assertSame(1, $db->save($user));
+        self::assertSame(1, $db->save($article));
+        self::assertSame([["id" => 0, "name" => "After"]], $db->all("SELECT * FROM users"));
+        self::assertSame([["article_key" => "0", "category_id" => 3, "fallback_id" => 2]], $db->all("SELECT * FROM articles"));
+    }
+
     public function testModelSavePreservesUnselectedDefaultsAndConcurrentEdits(): void
     {
         $db = new Db(self::memory());
@@ -558,6 +659,113 @@ final class DbTest extends TestCase
         $user->delete();
 
         $this->assertNull(DbModelUser::find(1));
+    }
+
+    public function testModelsRouteReadsSavesAndDeletesToTheirConfiguredDatabase(): void
+    {
+        $main = new Db(self::memory());
+        $archive = new Db(self::memory());
+        foreach ([$main, $archive] as $database) {
+            $database->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+        }
+        $main->execute("INSERT INTO users VALUES (1, 'Main')");
+        $archive->execute("INSERT INTO users VALUES (1, 'Archive')");
+        Model::useDb($main);
+        DbModelUser::useConnection($archive);
+
+        try {
+            $user = DbModelUser::find(1);
+            self::assertInstanceOf(DbModelUser::class, $user);
+            self::assertSame("Archive", $user->name);
+            self::assertSame("Main", DbDefaultConnectionUser::find(1)?->name);
+            self::assertSame("Main", $main->select(DbModelUser::class)->find(1)?->name);
+
+            $user->name = "Updated archive";
+            self::assertSame(1, $user->save());
+            self::assertSame("Updated archive", $archive->scalar("SELECT name FROM users WHERE id = 1"));
+            self::assertSame(1, $user->delete());
+            self::assertNull(DbModelUser::find(1));
+            self::assertSame("Main", DbDefaultConnectionUser::find(1)?->name);
+        } finally {
+            DbModelUser::useConnection(null);
+        }
+
+        self::assertSame("Main", DbModelUser::find(1)?->name);
+    }
+
+    public function testModelsInheritConnectionsAndCanOverrideThem(): void
+    {
+        $main = new Db(self::memory());
+        $archive = new Db(self::memory());
+        $main->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+        $archive->execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
+        $main->execute("INSERT INTO users VALUES (1, 'Main')");
+        $archive->execute("INSERT INTO users VALUES (1, 'Archive')");
+
+        Model::useDb($main);
+        DbConnectionBaseUser::useConnection($archive);
+
+        try {
+            self::assertSame("Archive", DbDefaultConnectionUser::find(1)?->name);
+            self::assertSame("Main", DbModelUser::find(1)?->name);
+
+            DbDefaultConnectionUser::useConnection($main);
+            self::assertSame("Main", DbDefaultConnectionUser::find(1)?->name);
+
+            DbDefaultConnectionUser::useConnection(null);
+            self::assertSame("Archive", DbDefaultConnectionUser::find(1)?->name);
+        } finally {
+            DbDefaultConnectionUser::useConnection(null);
+            DbConnectionBaseUser::useConnection(null);
+        }
+
+        self::assertSame("Main", DbDefaultConnectionUser::find(1)?->name);
+    }
+
+    public function testRelationshipsRejectRoutedModelsOnAnotherConnection(): void
+    {
+        $main = new Db(self::memory());
+        $archive = new Db(self::memory());
+        foreach ([$main, $archive] as $db) {
+            $db->execute("CREATE TABLE invoices (invoice_no TEXT PRIMARY KEY)");
+            $db->execute("CREATE TABLE invoice_lines (invoice_ref TEXT, line_amount REAL)");
+            $db->execute("INSERT INTO invoices VALUES ('same-id')");
+        }
+        $main->execute("INSERT INTO invoice_lines VALUES ('same-id', 10)");
+        $archive->execute("INSERT INTO invoice_lines VALUES ('same-id', 20)");
+        Model::useDb($main);
+        DbInvoice::useConnection($archive);
+        DbInvoiceLine::useConnection($archive);
+
+        try {
+            self::assertSame(20.0, DbInvoice::find("same-id", "lines")?->lines[0]->amount);
+
+            foreach ([
+                "invoice" => [
+                    fn() => $main->select(DbInvoiceLine::class)->with("invoice")->first(),
+                    fn() => $main->select(DbInvoiceLine::class)->joinRelation("invoice"),
+                ],
+                "lines" => [
+                    fn() => $main->select(DbInvoice::class)->whereHas("lines"),
+                    fn() => $main->select(DbInvoice::class)->withCount("lines"),
+                    fn() => $main->select(DbInvoice::class)->withSum("lines", "amount"),
+                ],
+            ] as $relation => $operations) {
+                foreach ($operations as $operation) {
+                    try {
+                        $operation();
+                    } catch (\RuntimeException $exception) {
+                        self::assertStringContainsString("Relationship '{$relation}'", $exception->getMessage());
+                        self::assertStringContainsString("different database connection", $exception->getMessage());
+                        continue;
+                    }
+                    self::fail("Expected relationship '{$relation}' to reject the other connection.");
+                }
+            }
+        } finally {
+            DbInvoice::useConnection(null);
+            DbInvoiceLine::useConnection(null);
+        }
     }
 
     public function testFacadeTransactionsFollowTheModelDatabaseAndRollBackModelWrites(): void
@@ -1521,6 +1729,27 @@ final class DbModelUser extends Model
 
     #[Column("name")]
     public string $name;
+}
+
+abstract class DbConnectionBaseUser extends Model
+{
+}
+
+#[Table("users")]
+final class DbDefaultConnectionUser extends DbConnectionBaseUser
+{
+    #[PrimaryKey]
+    public int $id;
+
+    #[Column]
+    public string $name;
+}
+
+#[Table("default_only_fixture")]
+final class DbDefaultOnlyModel extends Model
+{
+    #[PrimaryKey]
+    public ?int $id = null;
 }
 
 #[Table("tracked_users")]

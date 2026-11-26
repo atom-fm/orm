@@ -83,10 +83,15 @@ final readonly class Db
             }
         }
 
-        $affected = $this->execute(Query::insert($metadata->tableName)->values($values));
+        $query = Query::insert($metadata->tableName)->values($values);
+        if ($values === [] && $autoIncrementKey !== null) {
+            $query->defaultValues();
+        }
 
-        if ($autoIncrementKey !== null) {
-            $id = $this->connection->lastInsertId();
+        if ($autoIncrementKey === null) {
+            $affected = $this->execute($query);
+        } else {
+            [$affected, $id] = $this->connection->insertWithGeneratedKey($query, $autoIncrementKey->columnName);
             if ($id !== false) {
                 $autoIncrementKey->setValue($entity, $this->coercePrimaryKey($id, $autoIncrementKey->propertyType));
             }
@@ -236,6 +241,7 @@ final readonly class Db
                 throw new RuntimeException("Relation '{$relationName}' is not defined on {$className}.");
             }
 
+            $relation->assertConnection($this, (string) $relationName);
             $relation->createRelation($factory)->load($this, $entities);
             if ($nested !== []) {
                 $this->loadRelationPaths($relation->relatedClass, $relation->relatedModels($entities), $nested);
@@ -284,7 +290,7 @@ final readonly class Db
 
     private function isEmptyPrimaryKey(mixed $value): bool
     {
-        return $value === null || $value === "" || $value === 0 || $value === "0";
+        return $value === null || $value === "";
     }
 
     private function coercePrimaryKey(string $value, string $type): mixed

@@ -7,6 +7,7 @@ namespace Atom\Database\Orm;
 use Atom\Database\Exception\UniqueViolationException;
 use Atom\Database\Sql\Command;
 use Atom\Database\Sql\Compiler\QueryCompilerInterface;
+use Atom\Database\Sql\InsertQuery;
 use Closure;
 use Atom\Database\Sql\SelectQuery;
 use Atom\Database\Sql\SqlQueryInterface;
@@ -103,6 +104,25 @@ class PdoConnection
         return $this->pdo()->lastInsertId($name);
     }
 
+    /**
+     * @internal
+     * @return array{int, string|false}
+     */
+    public function insertWithGeneratedKey(InsertQuery $query, string $column): array
+    {
+        if ($this->pdo()->getAttribute(PDO::ATTR_DRIVER_NAME) === "pgsql") {
+            $command = $this->compile($query);
+            $identifier = '"' . str_replace('"', '""', $column) . '"';
+            $id = $this->scalar(new Command($command->sql . " RETURNING " . $identifier, $command->parameters));
+
+            return $id === false ? [0, false] : [1, (string) $id];
+        }
+
+        $affected = $this->execute($query);
+
+        return [$affected, $affected > 0 ? $this->lastInsertId() : false];
+    }
+
     public function transaction(callable $callback): mixed
     {
         $pdo = $this->pdo();
@@ -148,15 +168,21 @@ class PdoConnection
     private function prepare(string|SqlQueryInterface|Command $query, array $parameters): PDOStatement
     {
         $command = match (true) {
-            is_string($query) => new Command($query, $parameters),
-            $query instanceof Command => $parameters === []
-                ? $query
-                : new Command($query->sql, array_replace($query->parameters, $parameters)),
+            is_string($query) => new Command($query),
+            $query instanceof Command => $query,
             default => $this->compile($query),
         };
         $statement = $this->pdo()->prepare($command->sql);
 
-        foreach ($command->parameters as $name => $value) {
+        $bindings = [];
+        foreach ([$command->parameters, $parameters] as $source) {
+            foreach ($source as $name => $value) {
+                $key = is_string($name) ? ":" . ltrim($name, ":") : $name;
+                $bindings[$key] = $value;
+            }
+        }
+
+        foreach ($bindings as $name => $value) {
             $statement->bindValue($name, $value, $this->parameterType($value));
         }
 

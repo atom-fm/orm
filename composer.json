@@ -31,10 +31,5 @@
         }
     },
     "minimum-stability": "dev",
-    "prefer-stable": true,
-    "repositories": [{
-        "name": "sql",
-        "type": "vcs",
-        "url": "https://github.com/atom-fm/sql"
-    }]
+    "prefer-stable": true
 }
